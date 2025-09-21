@@ -6,11 +6,12 @@ Diffusers' pipelines can be used as an inference engine for a server. It support
 This guide will show you how to use the [`StableDiffusion3Pipeline`] in a server, but feel free to use any pipeline you want.
 
 
-Start by navigating to the `examples/server` folder and installing all of the dependencies.
+Start by installing diffuser, navigating to the `examples/server` folder and installing all of the dependencies.
 
 ```py
 pip install .
-pip install -f requirements.txt
+cd examples/server
+pip install -r requirements.txt
 ```
 
 Launch the server with the following command.
