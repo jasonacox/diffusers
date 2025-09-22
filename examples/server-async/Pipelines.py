@@ -7,6 +7,7 @@ import torch
 from pydantic import BaseModel
 
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
+from diffusers import FluxPipeline
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,12 @@ class PresetModels:
             "stabilityai/stable-diffusion-3.5-large",
             "stabilityai/stable-diffusion-3.5-large-turbo",
             "stabilityai/stable-diffusion-3.5-medium",
+        ]
+    )
+    FLUX: List[str] = field(
+        default_factory=lambda: [
+            "black-forest-labs/FLUX.1-schnell",
+            "black-forest-labs/FLUX.1-dev",
         ]
     )
 
@@ -58,6 +65,34 @@ class TextToImagePipelineSD3:
             raise Exception("No CUDA or MPS device available")
 
 
+class TextToImagePipelineFlux:
+    def __init__(self, model_path: str | None = None):
+        self.model_path = model_path or os.getenv("MODEL_PATH")
+        self.pipeline: FluxPipeline | None = None
+        self.device: str | None = None
+
+    def start(self):
+        if torch.cuda.is_available():
+            model_path = self.model_path or "black-forest-labs/FLUX.1-schnell"
+            logger.info("Loading Flux with CUDA")
+            self.device = "cuda"
+            self.pipeline = FluxPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+            )
+            self.pipeline.enable_model_cpu_offload()  # Save VRAM by offloading to CPU
+        elif torch.backends.mps.is_available():
+            model_path = self.model_path or "black-forest-labs/FLUX.1-schnell"
+            logger.info("Loading Flux with MPS for Mac M Series")
+            self.device = "mps"
+            self.pipeline = FluxPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+            ).to(device=self.device)
+        else:
+            raise Exception("No CUDA or MPS device available")
+
+
 class ModelPipelineInitializer:
     def __init__(self, model: str = "", type_models: str = "t2im"):
         self.model = model
@@ -78,11 +113,15 @@ class ModelPipelineInitializer:
             self.model_type = "SD3"
         elif self.model in preset_models.SD3_5:
             self.model_type = "SD3_5"
+        elif self.model in preset_models.FLUX:
+            self.model_type = "FLUX"
 
         # Create appropriate pipeline based on model type and type_models
         if self.type_models == "t2im":
             if self.model_type in ["SD3", "SD3_5"]:
                 self.pipeline = TextToImagePipelineSD3(self.model)
+            elif self.model_type == "FLUX":
+                self.pipeline = TextToImagePipelineFlux(self.model)
             else:
                 raise ValueError(f"Model type {self.model_type} not supported for text-to-image")
         elif self.type_models == "t2v":

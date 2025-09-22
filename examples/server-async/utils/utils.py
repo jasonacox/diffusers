@@ -13,13 +13,15 @@ logger = logging.getLogger(__name__)
 class Utils:
     def __init__(self, host: str = "0.0.0.0", port: int = 8500):
         self.service_url = f"http://{host}:{port}"
-        self.image_dir = os.path.join(tempfile.gettempdir(), "images")
+        # Use current working directory instead of system temp directory
+        current_dir = os.getcwd()
+        self.image_dir = os.path.join(current_dir, "images")
         if not os.path.exists(self.image_dir):
-            os.makedirs(self.image_dir)
+            os.makedirs(self.image_dir, mode=0o755)
 
-        self.video_dir = os.path.join(tempfile.gettempdir(), "videos")
+        self.video_dir = os.path.join(current_dir, "videos")
         if not os.path.exists(self.video_dir):
-            os.makedirs(self.video_dir)
+            os.makedirs(self.video_dir, mode=0o755)
 
     def save_image(self, image):
         if hasattr(image, "to"):

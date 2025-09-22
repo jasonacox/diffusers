@@ -21,7 +21,7 @@ from utils import RequestScopedPipeline, Utils
 
 @dataclass
 class ServerConfigModels:
-    model: str = "stabilityai/stable-diffusion-3.5-medium"
+    model: str = "black-forest-labs/FLUX.1-schnell"  # Default to Flux schnell for faster generation
     type_models: str = "t2im"
     constructor_pipeline: Optional[Type] = None
     custom_pipeline: Optional[Type] = None
@@ -115,6 +115,8 @@ class JSONBodyQueryAPI(BaseModel):
     negative_prompt: str | None = None
     num_inference_steps: int = 28
     num_images_per_prompt: int = 1
+    guidance_scale: float | None = None  # For Flux models, use 0.0
+    max_sequence_length: int | None = None  # For Flux models, typically 256
 
 
 @app.middleware("http")
@@ -136,6 +138,8 @@ async def api(json: JSONBodyQueryAPI):
     negative_prompt = json.negative_prompt or ""
     num_steps = json.num_inference_steps
     num_images_per_prompt = json.num_images_per_prompt
+    guidance_scale = json.guidance_scale
+    max_sequence_length = json.max_sequence_length
 
     wrapper = app.state.MODEL_PIPELINE
     initializer = app.state.MODEL_INITIALIZER
@@ -155,15 +159,41 @@ async def api(json: JSONBodyQueryAPI):
 
     def infer():
         gen = make_generator()
-        return req_pipe.generate(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            generator=gen,
-            num_inference_steps=num_steps,
-            num_images_per_prompt=num_images_per_prompt,
-            device=initializer.device,
-            output_type="pil",
-        )
+        
+        # Determine model type and set appropriate parameters
+        model_type = getattr(initializer, 'model_type', None)
+        
+        if model_type == "FLUX":
+            # Flux-specific parameters
+            kwargs = {
+                "prompt": prompt,
+                "generator": gen,
+                "num_inference_steps": num_steps,
+                "num_images_per_prompt": num_images_per_prompt,
+                "device": initializer.device,
+                "output_type": "pil",
+                "guidance_scale": guidance_scale if guidance_scale is not None else 0.0,
+            }
+            if max_sequence_length is not None:
+                kwargs["max_sequence_length"] = max_sequence_length
+            else:
+                kwargs["max_sequence_length"] = 256
+                
+        else:
+            # SD3/SD3.5 parameters
+            kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "generator": gen,
+                "num_inference_steps": num_steps,
+                "num_images_per_prompt": num_images_per_prompt,
+                "device": initializer.device,
+                "output_type": "pil",
+            }
+            if guidance_scale is not None:
+                kwargs["guidance_scale"] = guidance_scale
+
+        return req_pipe.generate(**kwargs)
 
     try:
         async with app.state.metrics_lock:

@@ -1,4 +1,5 @@
 import copy
+import inspect
 import threading
 from typing import Any, Iterable, List, Optional
 
@@ -36,6 +37,7 @@ class RequestScopedPipeline:
         tensor_numel_threshold: int = 1_000_000,
         tokenizer_lock: Optional[threading.Lock] = None,
         wrap_scheduler: bool = True,
+        wrap_tokenizers: bool = True,
     ):
         self._base = pipeline
         self.unet = getattr(pipeline, "unet", None)
@@ -49,6 +51,7 @@ class RequestScopedPipeline:
 
         self._mutable_attrs = list(mutable_attrs) if mutable_attrs is not None else list(self.DEFAULT_MUTABLE_ATTRS)
         self._tokenizer_lock = tokenizer_lock if tokenizer_lock is not None else threading.Lock()
+        self._wrap_tokenizers = bool(wrap_tokenizers)
 
         self._auto_detect_mutables = bool(auto_detect_mutables)
         self._tensor_numel_threshold = int(tensor_numel_threshold)
@@ -205,6 +208,38 @@ class RequestScopedPipeline:
 
         return has_tokenizer_methods and (has_tokenizer_in_name or has_tokenizer_attrs)
 
+    class TokenizerProxy:
+        """Thread-safe proxy for tokenizer-like objects preserving full interface."""
+        def __init__(self, tokenizer, lock: threading.Lock):
+            object.__setattr__(self, "_tokenizer", tokenizer)
+            object.__setattr__(self, "_lock", lock)
+
+        def __call__(self, *args, **kwargs):
+            lock = object.__getattribute__(self, "_lock")
+            tok = object.__getattribute__(self, "_tokenizer")
+            with lock:
+                return tok(*args, **kwargs)
+
+        def __getattr__(self, name):
+            tok = object.__getattribute__(self, "_tokenizer")
+            return getattr(tok, name)
+
+        def __dir__(self):
+            tok = object.__getattribute__(self, "_tokenizer")
+            return dir(tok)
+
+    @staticmethod
+    def _filter_kwargs_for_callable(func, kwargs: dict) -> dict:
+        try:
+            sig = inspect.signature(func)
+        except (TypeError, ValueError):
+            return kwargs
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        allowed = set(params.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+
     def generate(self, *args, num_inference_steps: int = 50, device: Optional[str] = None, **kwargs):
         local_scheduler = self._make_local_scheduler(num_inference_steps=num_inference_steps, device=device)
 
@@ -231,56 +266,44 @@ class RequestScopedPipeline:
 
         self._clone_mutable_attrs(self._base, local_pipe)
 
-        # 4) wrap tokenizers on the local pipe with the lock wrapper
-        tokenizer_wrappers = {}  # name -> original_tokenizer
-        try:
-            # a) wrap direct tokenizer attributes (tokenizer, tokenizer_2, ...)
-            for name in dir(local_pipe):
-                if "tokenizer" in name and not name.startswith("_"):
-                    tok = getattr(local_pipe, name, None)
-                    if tok is not None and self._is_tokenizer_component(tok):
-                        tokenizer_wrappers[name] = tok
-                        setattr(
-                            local_pipe,
-                            name,
-                            lambda *args, tok=tok, **kwargs: safe_tokenize(
-                                tok, *args, lock=self._tokenizer_lock, **kwargs
-                            ),
-                        )
-
-            # b) wrap tokenizers in components dict
-            if hasattr(local_pipe, "components") and isinstance(local_pipe.components, dict):
-                for key, val in local_pipe.components.items():
-                    if val is None:
-                        continue
-
-                    if self._is_tokenizer_component(val):
-                        tokenizer_wrappers[f"components[{key}]"] = val
-                        local_pipe.components[key] = lambda *args, tokenizer=val, **kwargs: safe_tokenize(
-                            tokenizer, *args, lock=self._tokenizer_lock, **kwargs
-                        )
-
-        except Exception as e:
-            logger.debug(f"Tokenizer wrapping step encountered an error: {e}")
+        # 4) Optionally wrap tokenizers on the local pipe with a thread-safe proxy
+        tokenizer_wrappers = {}
+        if self._wrap_tokenizers:
+            try:
+                for name in dir(local_pipe):
+                    if "tokenizer" in name and not name.startswith("_"):
+                        tok = getattr(local_pipe, name, None)
+                        if tok is not None and self._is_tokenizer_component(tok):
+                            tokenizer_wrappers[name] = tok
+                            setattr(local_pipe, name, self.TokenizerProxy(tok, self._tokenizer_lock))
+                if hasattr(local_pipe, "components") and isinstance(local_pipe.components, dict):
+                    for key, val in list(local_pipe.components.items()):
+                        if val is None:
+                            continue
+                        if self._is_tokenizer_component(val):
+                            tokenizer_wrappers[f"components[{key}]"] = val
+                            local_pipe.components[key] = self.TokenizerProxy(val, self._tokenizer_lock)
+            except Exception as e:
+                logger.debug(f"Tokenizer wrapping step encountered an error: {e}")
 
         result = None
         cm = getattr(local_pipe, "model_cpu_offload_context", None)
         try:
+            filtered_kwargs = self._filter_kwargs_for_callable(getattr(local_pipe, "__call__", local_pipe), kwargs)
             if callable(cm):
                 try:
                     with cm():
-                        result = local_pipe(*args, num_inference_steps=num_inference_steps, **kwargs)
+                        result = local_pipe(*args, num_inference_steps=num_inference_steps, **filtered_kwargs)
                 except TypeError:
                     # cm might be a context manager instance rather than callable
                     try:
                         with cm:
-                            result = local_pipe(*args, num_inference_steps=num_inference_steps, **kwargs)
+                            result = local_pipe(*args, num_inference_steps=num_inference_steps, **filtered_kwargs)
                     except Exception as e:
                         logger.debug(f"model_cpu_offload_context usage failed: {e}. Proceeding without it.")
-                        result = local_pipe(*args, num_inference_steps=num_inference_steps, **kwargs)
+                        result = local_pipe(*args, num_inference_steps=num_inference_steps, **filtered_kwargs)
             else:
-                # no offload context available — call directly
-                result = local_pipe(*args, num_inference_steps=num_inference_steps, **kwargs)
+                result = local_pipe(*args, num_inference_steps=num_inference_steps, **filtered_kwargs)
 
             return result
 
@@ -289,7 +312,8 @@ class RequestScopedPipeline:
                 for name, tok in tokenizer_wrappers.items():
                     if name.startswith("components["):
                         key = name[len("components[") : -1]
-                        local_pipe.components[key] = tok
+                        if hasattr(local_pipe, "components") and isinstance(local_pipe.components, dict):
+                            local_pipe.components[key] = tok
                     else:
                         setattr(local_pipe, name, tok)
             except Exception as e:
