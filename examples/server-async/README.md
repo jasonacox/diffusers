@@ -1,6 +1,6 @@
 # Asynchronous server and parallel execution of models
 
-> Example/demo server that keeps a single model in memory while safely running parallel inference requests by creating per-request lightweight views and cloning only small, stateful components (schedulers, RNG state, small mutable attrs). Works with StableDiffusion3 pipelines.
+> Example/demo server that keeps a single model in memory while safely running parallel inference requests by creating per-request lightweight views and cloning only small, stateful components (schedulers, RNG state, small mutable attrs). Works with Stable Diffusion 3/3.5 and FLUX pipelines.
 > We recommend running 10 to 50 inferences in parallel for optimal performance, averaging between 25 and 30 seconds to 1 minute and 1 minute and 30 seconds. (This is only recommended if you have a GPU with 35GB of VRAM or more; otherwise, keep it to one or two inferences in parallel to avoid decoding or saving errors due to memory shortages.)
 
 ## ⚠️ IMPORTANT
@@ -18,9 +18,12 @@ server-async/
 ├─────── scheduler.py              # BaseAsyncScheduler wrapper and async_retrieve_timesteps for secure inferences
 ├─────── requestscopedpipeline.py  # RequestScoped Pipeline for inference with a single in-memory model
 ├─────── utils.py                  # Image/video saving utilities and service configuration
-├── Pipelines.py                   # pipeline loader classes (SD3)
+├── Pipelines.py                   # pipeline loader classes (SD3, SD3.5, FLUX)
 ├── serverasync.py                 # FastAPI app with lifespan management and async inference endpoints
 ├── test.py                        # Client test script for inference requests
+├── test_openai.py                 # OpenAI-style client (no SDK) for /v1 endpoints
+├── test_openai_sdk.py             # Uses OpenAI Python SDK to call /v1 endpoints
+├── run.sh                         # Helper to run with uvicorn (reload)
 ├── requirements.txt               # Dependencies
 └── README.md                      # This documentation
 ```
@@ -117,6 +120,93 @@ Response example:
 - `GET /images/{filename}` - Serve generated images
 - `GET /api/status` - Server status and memory info
 
+### 5) OpenAI-compatible endpoints (Images API)
+
+These endpoints mimic the OpenAI Images API so you can use the OpenAI Python library or any OpenAI-style client.
+
+- `GET /v1/models` – List available preset model IDs and which one is currently loaded
+- `POST /v1/images/generations` – Generate images
+
+Request fields for `/v1/images/generations`:
+
+- `prompt` (string, required)
+- `size` (string, optional; e.g., `"1024x1024"`, defaults to `"1024x1024"`)
+- `n` (int, optional; default `1`)
+- `response_format` (string, optional; `"url"` or `"b64_json"`, default `"url"`)
+- `model` (string, optional; currently uses the loaded model; multi-model loading is a future enhancement)
+
+Responses:
+
+- URL form: `{ "created": 1726930000, "data": [ { "url": "http://.../images/<file>.png" } ] }`
+- Base64 form: `{ "created": 1726930000, "data": [ { "b64_json": "<base64>" } ] }`
+
+Tip: If you bind the server to `0.0.0.0`, returned URLs will default to `http://127.0.0.1:8500`. To expose externally, set `SERVICE_URL` (e.g., `export SERVICE_URL=http://myhost:8500`).
+
+#### Using the OpenAI Python library
+
+Install the SDK (optional for this server):
+
+```bash
+pip install "openai>=1,<2"
+```
+
+Use the SDK to call your local server:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8500/v1", api_key="not-needed")
+
+# URL response
+result = client.images.generate(
+  model="black-forest-labs/FLUX.1-schnell",
+  prompt="a cozy cabin in the woods, watercolor",
+  size="512x512",
+  n=1,
+  response_format="url",
+)
+print(result.data[0].url)
+
+# Base64 response
+result = client.images.generate(
+  model="black-forest-labs/FLUX.1-schnell",
+  prompt="a cozy cabin in the woods, watercolor",
+  size="512x512",
+  n=1,
+  response_format="b64_json",
+)
+b64 = result.data[0].b64_json
+```
+
+Or try the included scripts:
+
+- Without SDK: `python test_openai.py --prompt "a cozy cabin" --size 256x256 --response-format url`
+- With SDK: `python test_openai_sdk.py --prompt "a cozy cabin" --size 256x256 --response-format url`
+
+#### Curl examples
+
+- List models
+
+```bash
+curl -s http://127.0.0.1:8500/v1/models | jq
+```
+
+- Generate image (URL response)
+
+```bash
+curl -s -X POST http://127.0.0.1:8500/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a cozy cabin in the woods, watercolor","size":"256x256","n":1,"response_format":"url"}' | jq
+```
+
+- Generate image (base64 response)
+
+```bash
+curl -s -X POST http://127.0.0.1:8500/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a cozy cabin in the woods, watercolor","size":"256x256","n":1,"response_format":"b64_json"}' | jq -r '.data[0].b64_json' | base64 -d > openai_b64.png
+```
+
 ## Advanced Configuration
 
 ### RequestScopedPipeline Parameters
@@ -146,11 +236,56 @@ The server configuration can be modified in `serverasync.py` through the `Server
 ```python
 @dataclass
 class ServerConfigModels:
-    model: str = 'stabilityai/stable-diffusion-3.5-medium'  
-    type_models: str = 't2im'  
-    host: str = '0.0.0.0' 
+    model: str = 'black-forest-labs/FLUX.1-schnell'
+    type_models: str = 't2im'
+    host: str = '0.0.0.0'
     port: int = 8500
 ```
+
+## Containerization
+
+We provide a simple Dockerfile to run the server as a container.
+
+### Build
+
+From the `examples/server-async` directory:
+
+```bash
+docker build -t diffusers-server-async:latest .
+```
+
+### Run (CPU)
+
+```bash
+docker run --rm -p 8500:8500 \
+  -e MODEL_PATH="black-forest-labs/FLUX.1-schnell" \
+  -e SERVICE_URL="http://localhost:8500" \
+  diffusers-server-async:latest
+```
+
+Notes:
+- `SERVICE_URL` ensures returned image URLs are reachable from outside the container (set to your host/port).
+- For persistence of generated files, mount a volume:
+
+```bash
+docker run --rm -p 8500:8500 \
+  -v $(pwd)/images:/app/images \
+  -e SERVICE_URL="http://localhost:8500" \
+  diffusers-server-async:latest
+```
+
+### Run with GPU (NVIDIA)
+
+If your host has an NVIDIA GPU and drivers, pass the GPU through to the container (requires NVIDIA Container Toolkit):
+
+```bash
+docker run --rm -p 8500:8500 --gpus all \
+  -e MODEL_PATH="black-forest-labs/FLUX.1-schnell" \
+  -e SERVICE_URL="http://localhost:8500" \
+  diffusers-server-async:latest
+```
+
+Depending on your environment, you may prefer a CUDA-enabled base image preloaded with CUDA libs. The provided Dockerfile targets CPU by default and will work with GPU if the host provides the necessary drivers via the NVIDIA runtime.
 
 ## Troubleshooting (quick)
 

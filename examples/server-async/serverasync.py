@@ -4,6 +4,9 @@ import logging
 import os
 import random
 import threading
+import time
+import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Type
@@ -13,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+sys.path.insert(0, str(Path(__file__).parent))
 from Pipelines import ModelPipelineInitializer
 from pydantic import BaseModel
 
@@ -254,7 +258,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if __name__ == "__main__":
-    import uvicorn
+ 
 
-    uvicorn.run(app, host=server_config.host, port=server_config.port)
+# -----------------------------
+# OpenAI-compatible endpoints
+# -----------------------------
+
+class OpenAIImageRequest(BaseModel):
+    model: str | None = None
+    prompt: str
+    size: str | None = None  # e.g., "1024x1024"
+    n: int | None = 1
+    response_format: str | None = "url"  # "url" or "b64_json"
+    user: str | None = None
+
+
+@app.get("/v1/models")
+async def list_models():
+    try:
+        initializer = app.state.MODEL_INITIALIZER
+        from Pipelines import PresetModels
+
+        presets = PresetModels()
+        data = []
+        # Flatten lists keeping type
+        for m in presets.SD3:
+            data.append({
+                "id": m,
+                "object": "model",
+                "created": 0,
+                "owned_by": "community",
+            })
+        for m in presets.SD3_5:
+            data.append({
+                "id": m,
+                "object": "model",
+                "created": 0,
+                "owned_by": "community",
+            })
+        for m in presets.FLUX:
+            data.append({
+                "id": m,
+                "object": "model",
+                "created": 0,
+                "owned_by": "community",
+            })
+
+        return {"object": "list", "data": data, "loaded": initializer.model}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list models: {e}")
+
+
+@app.post("/v1/images/generations")
+async def images_generations(body: OpenAIImageRequest):
+    # Map to our existing generation flow
+    prompt = body.prompt
+    n = body.n or 1
+    size = body.size
+    response_format = (body.response_format or "url").lower()
+
+    utils_app = app.state.utils_app
+    initializer = app.state.MODEL_INITIALIZER
+
+    if not prompt or not prompt.strip():
+        raise HTTPException(400, detail={
+            "error": {
+                "message": "Prompt is required",
+                "type": "invalid_request_error",
+            }
+        })
+
+    width, height = utils_app.parse_size(size)
+
+    def make_generator():
+        g = torch.Generator(device=initializer.device)
+        return g.manual_seed(random.randint(0, 10_000_000))
+
+    req_pipe = app.state.REQUEST_PIPE
+
+    def infer():
+        gen = make_generator()
+        model_type = getattr(initializer, 'model_type', None)
+        common = {
+            "prompt": prompt,
+            "generator": gen,
+            "num_images_per_prompt": n,
+            "device": initializer.device,
+            "output_type": "pil",
+            "width": width,
+            "height": height,
+        }
+        if model_type == "FLUX":
+            common.update({
+                "num_inference_steps": 28,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 256,
+            })
+        else:
+            common.update({
+                "num_inference_steps": 28,
+            })
+        return req_pipe.generate(**common)
+
+    try:
+        async with app.state.metrics_lock:
+            app.state.active_inferences += 1
+
+        output = await run_in_threadpool(infer)
+
+        async with app.state.metrics_lock:
+            app.state.active_inferences = max(0, app.state.active_inferences - 1)
+
+        data_items = []
+        for img in output.images:
+            if response_format == "b64_json":
+                b64 = utils_app.image_to_b64(img)
+                data_items.append({"b64_json": b64})
+            else:
+                url = utils_app.save_image(img)
+                data_items.append({"url": url})
+
+        return {
+            "created": int(time.time()),
+            "data": data_items,
+        }
+    except Exception as e:
+        async with app.state.metrics_lock:
+            app.state.active_inferences = max(0, app.state.active_inferences - 1)
+        raise HTTPException(500, detail={
+            "error": {
+                "message": f"Image generation failed: {e}",
+                "type": "server_error",
+            }
+        })

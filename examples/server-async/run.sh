@@ -13,11 +13,11 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MODEL_PATH=black-forest-labs/FLUX.1-schnell 
 #export MODEL_PATH=stabilityai/stable-diffusion-3.5-medium
-#export SERVICE_URL=http://localhost:8123 
+#export SERVICE_URL="http://localhost:8500"
 
 # Header
 echo "Starting server for $MODEL_PATH ..."
 echo ""
 
 # Start
-python serverasync.py
+uvicorn serverasync:app --host 0.0.0.0 --port 8500 --reload
